@@ -80,10 +80,9 @@ mic_wav [B,L]  ref_wav [B,L]
 ### Installation
 
 ```bash
-git clone <repo>
-cd kaka
-pip install torch torchaudio numpy scipy soundfile onnxruntime
-pip install pesq pystoi webrtc-noise-gain speexdsp pyrnnoise  # for evaluation/baseline comparison
+git clone https://github.com/miuda-ai/joint_aec_ns.git
+cd joint_aec_ns
+pip install -r requirements.txt
 ```
 
 ### Training
