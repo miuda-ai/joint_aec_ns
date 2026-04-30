@@ -9,6 +9,8 @@ import numpy as np
 import soundfile as sf
 import torch
 import onnxruntime as ort
+from scipy.signal import resample_poly
+from scipy.signal import correlate
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from src.model import JointAECNSModel, STFTProcessor
@@ -19,6 +21,56 @@ HOP_LENGTH = 160
 WIN_LENGTH = 320
 FREQ_BINS = 257
 GRU_HIDDEN = 64
+
+
+def ensure_mono(wav: np.ndarray) -> np.ndarray:
+    """Convert multi-channel audio to mono by channel averaging."""
+    if wav.ndim == 1:
+        return wav
+    return wav.mean(axis=1)
+
+
+def resample_wav(wav: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
+    """Resample waveform with polyphase filtering."""
+    if src_sr == dst_sr:
+        return wav.astype(np.float32)
+    g = np.gcd(src_sr, dst_sr)
+    up = dst_sr // g
+    down = src_sr // g
+    return resample_poly(wav.astype(np.float32), up, down).astype(np.float32)
+
+
+def shift_wav(wav: np.ndarray, delay_samples: int) -> np.ndarray:
+    """Shift waveform in time. Positive delay moves signal later (right-shift)."""
+    if delay_samples == 0:
+        return wav
+    out = np.zeros_like(wav)
+    if delay_samples > 0:
+        if delay_samples < len(wav):
+            out[delay_samples:] = wav[:-delay_samples]
+    else:
+        k = -delay_samples
+        if k < len(wav):
+            out[:-k] = wav[k:]
+    return out
+
+
+def estimate_ref_delay_samples(mic: np.ndarray, ref: np.ndarray, sr: int, max_delay_ms: float = 300.0) -> int:
+    """
+    Estimate delay where mic best correlates with ref.
+    Positive result means mic lags ref and ref should be delayed by this amount.
+    """
+    mic_n = (mic - mic.mean()) / (mic.std() + 1e-8)
+    ref_n = (ref - ref.mean()) / (ref.std() + 1e-8)
+    max_lag = int(max_delay_ms * sr / 1000.0)
+
+    c = correlate(mic_n, ref_n, mode="full", method="fft")
+    lags = np.arange(-len(ref_n) + 1, len(mic_n))
+    mask = (lags >= -max_lag) & (lags <= max_lag)
+    cc = c[mask]
+    ll = lags[mask]
+    best = int(ll[np.argmax(np.abs(cc))])
+    return best
 
 
 def pytorch_stream_inference(model, stft_proc, mic_wav, ref_wav):
@@ -101,6 +153,27 @@ def onnx_stream_inference(sess, stft_proc, mic_wav, ref_wav, gru_hidden=GRU_HIDD
     return enhanced.squeeze(0).cpu().numpy()
 
 
+def _extract_fixed_last_dim(shape, fallback: int) -> int:
+    """Extract a fixed last dimension from ONNX shape, otherwise return fallback."""
+    if isinstance(shape, (list, tuple)) and len(shape) > 0:
+        last = shape[-1]
+        if isinstance(last, int) and last > 0:
+            return last
+        if isinstance(last, str) and last.isdigit():
+            return int(last)
+    return fallback
+
+
+def infer_onnx_gru_hidden(sess: ort.InferenceSession, fallback: int) -> int:
+    """Infer GRU hidden dim from ONNX input signature (hid_mic/hid_ref)."""
+    hidden = fallback
+    for inp in sess.get_inputs():
+        if inp.name in ("hid_mic", "hid_ref"):
+            hidden = _extract_fixed_last_dim(inp.shape, hidden)
+            break
+    return hidden
+
+
 def main():
     parser = argparse.ArgumentParser(description="Generate demo audio samples (streaming mode)")
     parser.add_argument("--onnx", type=str, default=None,
@@ -113,6 +186,24 @@ def main():
                         help="override conv_channels")
     parser.add_argument("--gru_hidden", type=int, default=None,
                         help="override gru_hidden")
+    parser.add_argument("--mic", type=str, default="mix_capture_echo.wav",
+                        help="microphone capture wav path")
+    parser.add_argument("--ref", type=str, default="mix_render_play.wav",
+                        help="render/playback reference wav path")
+    parser.add_argument("--clean", type=str, default="mix_near_answer.wav",
+                        help="optional clean reference wav path for alignment")
+    parser.add_argument("--out", type=str, default=None,
+                        help="output enhanced wav path")
+    parser.add_argument("--model_sr", type=int, default=SR,
+                        help="model processing sample rate")
+    parser.add_argument("--out_sr", type=str, default="input", choices=["input", "model"],
+                        help="output wav sample rate: input (default) or model")
+    parser.add_argument("--ref_delay_ms", type=float, default=0.0,
+                        help="manual reference delay in ms (positive delays ref)")
+    parser.add_argument("--auto_ref_delay", action="store_true",
+                        help="estimate mic/ref delay by cross-correlation and align reference")
+    parser.add_argument("--max_delay_ms", type=float, default=300.0,
+                        help="max absolute delay (ms) for auto delay estimation")
     args = parser.parse_args()
 
     use_onnx = args.onnx is not None
@@ -127,10 +218,9 @@ def main():
         gru_hidden = args.gru_hidden
 
     # Create STFTProcessor
-    stft_proc = STFTProcessor(N_FFT, HOP_LENGTH, WIN_LENGTH, SR)
+    stft_proc = STFTProcessor(N_FFT, HOP_LENGTH, WIN_LENGTH, args.model_sr)
 
     if use_onnx:
-        print(f"Using ONNX model: {args.onnx}, gru_hidden={gru_hidden}")
         sess_opts = ort.SessionOptions()
         sess_opts.intra_op_num_threads = 1
         sess_opts.inter_op_num_threads = 1
@@ -139,6 +229,11 @@ def main():
             sess_options=sess_opts,
             providers=["CPUExecutionProvider"]
         )
+        inferred_hidden = infer_onnx_gru_hidden(sess, gru_hidden)
+        if inferred_hidden != gru_hidden:
+            print(f"ONNX hidden dim inferred as {inferred_hidden} (override from {gru_hidden})")
+            gru_hidden = inferred_hidden
+        print(f"Using ONNX model: {args.onnx}, gru_hidden={gru_hidden}")
         print("ONNX model loaded")
         out_dir = "demo_onnx/"
     else:
@@ -181,37 +276,56 @@ def main():
 
     os.makedirs(out_dir, exist_ok=True)
 
-    # Generate demo for 3 samples
-    sim_dir = "data/simulated"
+    mic_path = args.mic
+    ref_path = args.ref
+    clean_path = args.clean
 
-    for i in range(3):
-        mic_path = f"{sim_dir}/mic/mic_{i:06d}.wav"
-        ref_path = f"{sim_dir}/ref/ref_{i:06d}.wav"
-        clean_path = f"{sim_dir}/clean/clean_{i:06d}.wav"
+    mic_wav, mic_sr = sf.read(mic_path)
+    ref_wav, ref_sr = sf.read(ref_path)
+    mic_wav = ensure_mono(np.asarray(mic_wav))
+    ref_wav = ensure_mono(np.asarray(ref_wav))
 
-        mic_wav, _ = sf.read(mic_path)
-        ref_wav, _ = sf.read(ref_path)
-        clean_wav, _ = sf.read(clean_path)
+    if ref_sr != mic_sr:
+        ref_wav = resample_wav(ref_wav, ref_sr, mic_sr)
 
+    if os.path.exists(clean_path):
+        clean_wav, clean_sr = sf.read(clean_path)
+        clean_wav = ensure_mono(np.asarray(clean_wav))
+        if clean_sr != mic_sr:
+            clean_wav = resample_wav(clean_wav, clean_sr, mic_sr)
         L = min(len(mic_wav), len(ref_wav), len(clean_wav))
-        mic_wav, ref_wav, clean_wav = mic_wav[:L], ref_wav[:L], clean_wav[:L]
+    else:
+        print(f"Warning: clean reference not found: {clean_path}. Proceeding without it.")
+        L = min(len(mic_wav), len(ref_wav))
+    mic_wav, ref_wav = mic_wav[:L], ref_wav[:L]
 
-        # Inference
-        if use_onnx:
-            enhanced = onnx_stream_inference(sess, stft_proc, mic_wav, ref_wav, gru_hidden=gru_hidden)
-        else:
-            enhanced = pytorch_stream_inference(model, stft_proc, mic_wav, ref_wav)
+    if args.auto_ref_delay:
+        est_delay = estimate_ref_delay_samples(mic_wav, ref_wav, mic_sr, max_delay_ms=args.max_delay_ms)
+        ref_wav = shift_wav(ref_wav, est_delay)
+        print(f"Auto ref delay applied: {est_delay} samples ({est_delay * 1000.0 / mic_sr:.2f} ms)")
+    elif args.ref_delay_ms != 0.0:
+        delay_samples = int(round(args.ref_delay_ms * mic_sr / 1000.0))
+        ref_wav = shift_wav(ref_wav, delay_samples)
+        print(f"Manual ref delay applied: {delay_samples} samples ({args.ref_delay_ms:.2f} ms)")
 
-        sf.write(f"{out_dir}/mic_{i:02d}.wav", mic_wav, SR)
-        sf.write(f"{out_dir}/clean_{i:02d}.wav", clean_wav, SR)
-        sf.write(f"{out_dir}/enhanced_{i:02d}.wav", enhanced, SR)
-        print(f"Sample {i}: saved mic, clean, enhanced")
+    if mic_sr != args.model_sr:
+        mic_wav = resample_wav(mic_wav, mic_sr, args.model_sr)
+        ref_wav = resample_wav(ref_wav, mic_sr, args.model_sr)
+        print(f"Resampled input audio: {mic_sr} -> {args.model_sr} Hz for model inference")
 
-    print(f"\nDemo files saved to {out_dir}/")
-    print("  mic_00.wav, mic_01.wav, mic_02.wav     - Noisy microphone input")
-    print("  clean_00.wav, clean_01.wav, clean_02.wav - Clean reference")
-    print("  enhanced_00.wav, enhanced_01.wav, enhanced_02.wav - Enhanced output")
+    if use_onnx:
+        enhanced = onnx_stream_inference(sess, stft_proc, mic_wav, ref_wav, gru_hidden=gru_hidden)
+    else:
+        enhanced = pytorch_stream_inference(model, stft_proc, mic_wav, ref_wav)
 
+    write_sr = mic_sr if args.out_sr == "input" else args.model_sr
+    if write_sr != args.model_sr:
+        enhanced = resample_wav(enhanced, args.model_sr, write_sr)
+        print(f"Resampled output audio: {args.model_sr} -> {write_sr} Hz for saving")
 
+    out_path = args.out if args.out is not None else f"{out_dir}/enhanced.wav"
+    sf.write(out_path, enhanced, write_sr)
+    print(f"Saved enhanced wav: {out_path}")
+    
 if __name__ == "__main__":
     main()
